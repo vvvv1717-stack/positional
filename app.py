@@ -8,6 +8,7 @@ import gzip
 import shutil
 from datetime import datetime, timedelta, timezone
 import concurrent.futures
+import zipfile
 
 # IST Offset
 IST_OFFSET = timedelta(hours=5, minutes=30)
@@ -150,6 +151,24 @@ def extract_date_from_filename(filename):
         return f"{d[:4]}-{d[4:6]}-{d[6:]}"
     return None
 
+def extract_csv_from_zip(zip_file):
+    try:
+        # zip_file is a UploadedFile object from streamlit
+        with zipfile.ZipFile(zip_file) as z:
+            # Find the first CSV file in the ZIP
+            csv_files = [f for f in z.namelist() if f.lower().endswith('.csv')]
+            if not csv_files:
+                st.error("No CSV file found in the ZIP archive.")
+                return None, None
+            
+            # Extract the first CSV found
+            csv_filename = csv_files[0]
+            with z.open(csv_filename) as f:
+                return f.read(), csv_filename
+    except Exception as e:
+        st.error(f"Error extracting ZIP file: {e}")
+        return None, None
+
 def load_token():
     if os.path.exists(TOKEN_FILE):
         try:
@@ -214,7 +233,7 @@ def load_nse_json():
         st.error(f"NSE.json not found at {NSE_JSON_PATH}")
         return pd.DataFrame()
 
-def process_bhavcopy(bhav_file, df_json):
+def process_bhavcopy(bhav_file, df_json, target_expiry_index=0):
     try:
         df_bhav = pd.read_csv(bhav_file)
         
@@ -231,10 +250,33 @@ def process_bhavcopy(bhav_file, df_json):
             return pd.DataFrame()
 
         futures['XpryDt'] = pd.to_datetime(futures['XpryDt'])
+        
+        # Filter out past expiries (Keep today and future)
+        # We use IST time to match the environment's expectation
+        ist_now = get_ist_now()
+        today = ist_now.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
+        
+        futures = futures[futures['XpryDt'] >= today]
+        if futures.empty:
+            st.warning("No future expiries found in the uploaded file.")
+            return pd.DataFrame()
+
         futures = futures.sort_values('XpryDt')
         
-        # Find nearest expiry per symbol
-        near_futures = futures.groupby('TckrSymb').first().reset_index()
+        # Identify unique expiry dates available in the bhavcopy
+        available_expiries = sorted(futures['XpryDt'].unique())
+        
+        # Select target expiry based on index (0 for Near, 1 for Next)
+        if target_expiry_index >= len(available_expiries):
+            # Fallback to the latest available if index is out of range
+            target_expiry = available_expiries[-1]
+        else:
+            target_expiry = available_expiries[target_expiry_index]
+
+        # Filter futures for the target expiry per symbol
+        near_futures = futures[futures['XpryDt'] == target_expiry].copy()
+        
+        # If a symbol doesn't have the target expiry, it will be skipped
         near_futures = near_futures[['TckrSymb', 'ClsPric', 'XpryDt']]
         near_futures = near_futures.rename(columns={'ClsPric': 'FuturePrice', 'XpryDt': 'FutureExpiryDate'})
 
@@ -246,7 +288,7 @@ def process_bhavcopy(bhav_file, df_json):
 
         options['XpryDt'] = pd.to_datetime(options['XpryDt'])
 
-        # Merge Options with Near Futures
+        # Merge Options with selected Futures expiry
         merged = pd.merge(options, near_futures, on='TckrSymb')
         merged = merged[merged['XpryDt'] == merged['FutureExpiryDate']]
         
@@ -499,7 +541,9 @@ def display_option_chain(df, access_token, key_suffix):
         )
 
 # --- Configuration Logic (Before Sidebar) ---
-is_client_view = "UPSTOX_ACCESS_TOKEN" in st.secrets
+# Check if we should enter "Client View" (No Sidebar, Token from Secrets)
+# To see the sidebar (Admin View), remove or comment out UPSTOX_ACCESS_TOKEN in .streamlit/secrets.toml
+is_client_view = "UPSTOX_ACCESS_TOKEN" in st.secrets and st.secrets["UPSTOX_ACCESS_TOKEN"].strip() != ""
 
 if is_client_view:
     # CLIENT VIEW DEFAULTS
@@ -514,6 +558,7 @@ if is_client_view:
     # Default refresh settings for clients
     auto_refresh = True
     refresh_interval = 15
+    target_expiry_idx = 0 # Default to current month for clients
     
 else:
     # ADMIN VIEW (Show Sidebar)
@@ -526,6 +571,17 @@ else:
         
         if access_token and access_token != saved_token:
             save_token(access_token)
+
+        st.markdown("---")
+        st.header("Expiry Settings")
+        # Expiry Selection for Monthly/Weekly/Intraday
+        expiry_type = st.radio(
+            "Select Expiry Month",
+            options=["Current Month", "Next Month"],
+            index=0,
+            help="Choose which expiry month to display data for."
+        )
+        target_expiry_idx = 0 if expiry_type == "Current Month" else 1
     
         st.markdown("---")
         st.header("Data Management")
@@ -557,15 +613,17 @@ else:
         
         # Monthly Uploader
         st.subheader("Monthly")
-        up_m = st.file_uploader("Upload Monthly Bhavcopy", type=['csv'], key='m_up')
+        up_m = st.file_uploader("Upload Monthly Bhavcopy", type=['zip'], key='m_up')
         if up_m is not None:
-            with open(FILES['Monthly'], "wb") as f:
-                f.write(up_m.getbuffer())
-            # Extract and save date
-            date_str = extract_date_from_filename(up_m.name)
-            if date_str:
-                save_meta('Monthly', date_str)
-            st.success("Monthly file updated!")
+            csv_content, csv_name = extract_csv_from_zip(up_m)
+            if csv_content:
+                with open(FILES['Monthly'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date from the CSV filename within the ZIP
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Monthly', date_str)
+                st.success(f"Monthly file updated from {csv_name}!")
         
         meta = load_meta()
         if 'Monthly' in meta and os.path.exists(FILES['Monthly']):
@@ -577,15 +635,17 @@ else:
         
         # Weekly Uploader
         st.subheader("Weekly")
-        up_w = st.file_uploader("Upload Weekly Bhavcopy", type=['csv'], key='w_up')
+        up_w = st.file_uploader("Upload Weekly Bhavcopy", type=['zip'], key='w_up')
         if up_w is not None:
-            with open(FILES['Weekly'], "wb") as f:
-                f.write(up_w.getbuffer())
-            # Extract and save date
-            date_str = extract_date_from_filename(up_w.name)
-            if date_str:
-                save_meta('Weekly', date_str)
-            st.success("Weekly file updated!")
+            csv_content, csv_name = extract_csv_from_zip(up_w)
+            if csv_content:
+                with open(FILES['Weekly'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Weekly', date_str)
+                st.success(f"Weekly file updated from {csv_name}!")
 
         if 'Weekly' in meta and os.path.exists(FILES['Weekly']):
             st.caption(f"📅 Data Date: {meta['Weekly']}")
@@ -595,15 +655,17 @@ else:
         
         # Intraday Uploader
         st.subheader("Intraday")
-        up_i = st.file_uploader("Upload Intraday Bhavcopy", type=['csv'], key='i_up')
+        up_i = st.file_uploader("Upload Intraday Bhavcopy", type=['zip'], key='i_up')
         if up_i is not None:
-            with open(FILES['Intraday'], "wb") as f:
-                f.write(up_i.getbuffer())
-            # Extract and save date
-            date_str = extract_date_from_filename(up_i.name)
-            if date_str:
-                save_meta('Intraday', date_str)
-            st.success("Intraday file updated!")
+            csv_content, csv_name = extract_csv_from_zip(up_i)
+            if csv_content:
+                with open(FILES['Intraday'], "wb") as f:
+                    f.write(csv_content)
+                # Extract and save date
+                date_str = extract_date_from_filename(csv_name)
+                if date_str:
+                    save_meta('Intraday', date_str)
+                st.success(f"Intraday file updated from {csv_name}!")
         
         if 'Intraday' in meta and os.path.exists(FILES['Intraday']):
             st.caption(f"📅 Data Date: {meta['Intraday']}")
@@ -628,33 +690,33 @@ if not nse_json_df.empty:
     run_every = refresh_interval if auto_refresh else None
 
     with tab1:
-        st.header("Monthly Options")
+        st.header(f"Monthly Options ({expiry_type if not is_client_view else 'Current Month'})")
         if os.path.exists(FILES['Monthly']):
             @st.fragment(run_every=run_every)
             def show_monthly():
-                df_m = process_bhavcopy(FILES['Monthly'], nse_json_df)
+                df_m = process_bhavcopy(FILES['Monthly'], nse_json_df, target_expiry_index=target_expiry_idx)
                 display_option_chain(df_m, access_token, "Monthly")
             show_monthly()
         else:
             st.info("Please upload a Monthly Bhavcopy in the sidebar to view data.")
 
     with tab2:
-        st.header("Weekly Options")
+        st.header(f"Weekly Options ({expiry_type if not is_client_view else 'Current Month'})")
         if os.path.exists(FILES['Weekly']):
             @st.fragment(run_every=run_every)
             def show_weekly():
-                df_w = process_bhavcopy(FILES['Weekly'], nse_json_df)
+                df_w = process_bhavcopy(FILES['Weekly'], nse_json_df, target_expiry_index=target_expiry_idx)
                 display_option_chain(df_w, access_token, "Weekly")
             show_weekly()
         else:
             st.info("Please upload a Weekly Bhavcopy in the sidebar to view data.")
 
     with tab3:
-        st.header("Intraday Options")
+        st.header(f"Intraday Options ({expiry_type if not is_client_view else 'Current Month'})")
         if os.path.exists(FILES['Intraday']):
             @st.fragment(run_every=run_every)
             def show_intraday():
-                df_i = process_bhavcopy(FILES['Intraday'], nse_json_df)
+                df_i = process_bhavcopy(FILES['Intraday'], nse_json_df, target_expiry_index=target_expiry_idx)
                 display_option_chain(df_i, access_token, "Intraday")
             show_intraday()
         else:
